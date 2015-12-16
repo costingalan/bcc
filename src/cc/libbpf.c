@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include "libbpf.h"
@@ -67,7 +68,19 @@ int bpf_create_map(enum bpf_map_type map_type, int key_size, int value_size, int
   attr.value_size = value_size;
   attr.max_entries = max_entries;
 
-  return syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
+  int ret = syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
+  if (ret < 0 && errno == EPERM) {
+    // see note below about the rationale for this retry
+
+    struct rlimit rl = {};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
+      rl.rlim_max = RLIM_INFINITY;
+      rl.rlim_cur = rl.rlim_max;
+      if (setrlimit(RLIMIT_MEMLOCK, &rl) == 0)
+        ret = syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
+    }
+  }
+  return ret;
 }
 
 int bpf_update_elem(int fd, void *key, void *value, unsigned long long flags)
@@ -138,6 +151,24 @@ int bpf_prog_load(enum bpf_prog_type prog_type,
     log_buf[0] = 0;
 
   int ret = syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
+  if (ret < 0 && errno == EPERM) {
+    // When EPERM is returned, two reasons are possible:
+    //  1. user has no permissions for bpf()
+    //  2. user has insufficent rlimit for locked memory
+    // Unfortunately, there is no api to inspect the current usage of locked
+    // mem for the user, so an accurate calculation of how much memory to lock
+    // for this new program is difficult to calculate. As a hack, bump the limit
+    // to unlimited. If program load fails again, return the error.
+
+    struct rlimit rl = {};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
+      rl.rlim_max = RLIM_INFINITY;
+      rl.rlim_cur = rl.rlim_max;
+      if (setrlimit(RLIMIT_MEMLOCK, &rl) == 0)
+        ret = syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
+    }
+  }
+
   if (ret < 0 && !log_buf) {
     // caller did not specify log_buf but failure should be printed,
     // so call recursively and print the result to stderr
@@ -178,8 +209,8 @@ int bpf_attach_socket(int sock, int prog) {
 
 static int bpf_attach_tracing_event(int progfd, const char *event_path,
     struct perf_reader *reader, int pid, int cpu, int group_fd) {
-  int efd = -1, rc = -1, pfd = -1;
-  ssize_t bytes = -1;
+  int efd = -1, pfd;
+  ssize_t bytes;
   char buf[256];
   struct perf_event_attr attr = {};
 
@@ -187,13 +218,13 @@ static int bpf_attach_tracing_event(int progfd, const char *event_path,
   efd = open(buf, O_RDONLY, 0);
   if (efd < 0) {
     fprintf(stderr, "open(%s): %s\n", buf, strerror(errno));
-    goto cleanup;
+    goto error;
   }
 
   bytes = read(efd, buf, sizeof(buf));
   if (bytes <= 0 || bytes >= sizeof(buf)) {
     fprintf(stderr, "read(%s): %s\n", buf, strerror(errno));
-    goto cleanup;
+    goto error;
   }
   buf[bytes] = '\0';
   attr.config = strtol(buf, NULL, 0);
@@ -204,91 +235,133 @@ static int bpf_attach_tracing_event(int progfd, const char *event_path,
   pfd = syscall(__NR_perf_event_open, &attr, pid, cpu, group_fd, PERF_FLAG_FD_CLOEXEC);
   if (pfd < 0) {
     perror("perf_event_open");
-    goto cleanup;
+    goto error;
   }
+  perf_reader_set_fd(reader, pfd);
 
-  if (perf_reader_mmap(reader, pfd, attr.sample_type) < 0)
-    goto cleanup;
+  if (perf_reader_mmap(reader, attr.type, attr.sample_type) < 0)
+    goto error;
 
   if (ioctl(pfd, PERF_EVENT_IOC_SET_BPF, progfd) < 0) {
     perror("ioctl(PERF_EVENT_IOC_SET_BPF)");
-    goto cleanup;
+    goto error;
   }
   if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
     perror("ioctl(PERF_EVENT_IOC_ENABLE)");
-    goto cleanup;
+    goto error;
   }
 
-  rc = pfd;
-  pfd = -1;
+  return 0;
 
-cleanup:
+error:
   if (efd >= 0)
     close(efd);
-  if (pfd >= 0)
-    close(pfd);
 
-  return rc;
+  return -1;
 }
 
 void * bpf_attach_kprobe(int progfd, const char *event,
                          const char *event_desc, pid_t pid,
                          int cpu, int group_fd, perf_reader_cb cb,
                          void *cb_cookie) {
-  int rc = -1, kfd = -1;
+  int kfd = -1;
   char buf[256];
   struct perf_reader *reader = NULL;
 
-  reader = perf_reader_new(-1, 8, cb, cb_cookie);
+  reader = perf_reader_new(cb, NULL, cb_cookie);
   if (!reader)
-    goto cleanup;
+    goto error;
 
   kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND, 0);
   if (kfd < 0) {
     perror("open(kprobe_events)");
-    goto cleanup;
+    goto error;
   }
 
   if (write(kfd, event_desc, strlen(event_desc)) < 0) {
     fprintf(stderr, "write of \"%s\" into kprobe_events failed: %s\n", event_desc, strerror(errno));
     if (errno == EINVAL)
       fprintf(stderr, "check dmesg output for possible cause\n");
-    goto cleanup;
+    goto error;
   }
 
   snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/events/kprobes/%s", event);
-  rc = bpf_attach_tracing_event(progfd, buf, reader, pid, cpu, group_fd);
-
-cleanup:
-  if (kfd >= 0)
-    close(kfd);
-  if (reader && rc < 0) {
-    perf_reader_free(reader);
-    reader = NULL;
-  }
+  if (bpf_attach_tracing_event(progfd, buf, reader, pid, cpu, group_fd) < 0)
+    goto error;
 
   return reader;
+
+error:
+  if (kfd >= 0)
+    close(kfd);
+  if (reader)
+    perf_reader_free(reader);
+
+  return NULL;
 }
 
 int bpf_detach_kprobe(const char *event_desc) {
-  int rc = -1, kfd = -1;
+  int kfd = -1;
 
   kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND, 0);
   if (kfd < 0) {
     perror("open(kprobe_events)");
-    goto cleanup;
+    goto error;
   }
 
   if (write(kfd, event_desc, strlen(event_desc)) < 0) {
     perror("write(kprobe_events)");
-    goto cleanup;
+    goto error;
   }
-  rc = 0;
 
-cleanup:
+  return 0;
+
+error:
   if (kfd >= 0)
     close(kfd);
 
-  return rc;
+  return -1;
 }
 
+void * bpf_open_perf_buffer(perf_reader_raw_cb raw_cb, void *cb_cookie, int pid, int cpu) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
+  int pfd;
+  struct perf_event_attr attr = {};
+  struct perf_reader *reader = NULL;
+
+  reader = perf_reader_new(NULL, raw_cb, cb_cookie);
+  if (!reader)
+    goto error;
+
+  attr.config = PERF_COUNT_SW_BPF_OUTPUT;
+  attr.type = PERF_TYPE_SOFTWARE;
+  attr.sample_type = PERF_SAMPLE_RAW;
+  attr.sample_period = 1;
+  attr.wakeup_events = 1;
+  pfd = syscall(__NR_perf_event_open, &attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+  if (pfd < 0) {
+    perror("perf_event_open");
+    goto error;
+  }
+  perf_reader_set_fd(reader, pfd);
+
+  if (perf_reader_mmap(reader, attr.type, attr.sample_type) < 0)
+    goto error;
+
+  if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
+    perror("ioctl(PERF_EVENT_IOC_ENABLE)");
+    goto error;
+  }
+
+  return reader;
+
+error:
+  if (reader)
+    perf_reader_free(reader);
+
+  return NULL;
+#else
+  fprintf(stderr, "PERF_COUNT_SW_BPF_OUTPUT feature unsupported\n");
+  return NULL;
+#endif
+}
